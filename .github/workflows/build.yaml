@@ -1,0 +1,86 @@
+name: Build, scan and attest
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CHAINLOOP_TOKEN: ${{ secrets.CHAINLOOP_TOKEN }}
+      CHAINLOOP_ORG: demo
+      CHAINLOOP_PROJECT: java4shell
+      CHAINLOOP_WORKFLOW: java4shell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Chainloop
+        run: curl -sfL https://dl.chainloop.dev/cli/install.sh | bash -s
+
+      - name: Initialize attestation
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          chainloop attestation init \
+            --org "$CHAINLOOP_ORG" \
+            --project "$CHAINLOOP_PROJECT" \
+            --workflow "$CHAINLOOP_WORKFLOW"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push image
+        run: |
+          docker build -t "$IMAGE:${GITHUB_SHA}" -t "$IMAGE:latest" .
+          docker push "$IMAGE:${GITHUB_SHA}"
+          docker push "$IMAGE:latest"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}:${{ github.sha }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+
+      - name: Scan SBOM for vulnerabilities
+        uses: anchore/scan-action@v6
+        with:
+          sbom: sbom.cdx.json
+          output-format: sarif
+          output-file: grype.sarif
+          fail-build: false
+
+      - name: Show Java4Shell match
+        run: |
+          jq -r '.runs[0].results[] | select(.ruleId | test("CVE-2026-114938")) | .message.text' grype.sarif
+
+      - name: Add materials to the attestation
+        run: |
+          chainloop attestation add --name image --value "$IMAGE:${GITHUB_SHA}"
+          chainloop attestation add --name sbom --value sbom.cdx.json
+          chainloop attestation add --name vulnerability-scan --value grype.sarif
+
+      - name: Push attestation
+        run: chainloop attestation push
+
+      - name: Mark attestation as failed
+        if: ${{ failure() }}
+        run: chainloop attestation reset || true
+
+      - name: Mark attestation as cancelled
+        if: ${{ cancelled() }}
+        run: chainloop attestation reset --trigger cancellation || true
